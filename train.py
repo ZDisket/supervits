@@ -32,6 +32,29 @@ from losses import (
 )
 from mel_processing import mel_spectrogram_torch, spec_to_mel_torch
 from text.symbols import symbols
+from text import text_to_sequence
+
+
+def get_text_for_eval(text, hps):
+    """Convert text to tensor for evaluation inference."""
+    text_norm = text_to_sequence(text, hps.data.text_cleaners)
+    if hps.data.add_blank:
+        text_norm = commons.intersperse(text_norm, 0)
+    text_norm = torch.LongTensor(text_norm)
+    return text_norm
+
+
+# Default test sentences for evaluation
+DEFAULT_EVAL_TEXTS = [
+    "The quick brown fox jumps over the lazy dog.",
+    "This is a test of the text to speech system.",
+    "How are you doing today? I hope everything is going well.",
+    "The weather is quite nice outside, perfect for a walk.",
+    "Machine learning models can generate surprisingly natural sounding speech.",
+]
+
+
+_eval_text_tensors = None
 
 
 torch.backends.cudnn.benchmark = False
@@ -44,7 +67,7 @@ def main():
 
   n_gpus = torch.cuda.device_count()
   os.environ['MASTER_ADDR'] = 'localhost'
-  os.environ['MASTER_PORT'] = '80000'
+  os.environ['MASTER_PORT'] = '55555'
 
   hps = utils.get_hparams()
   mp.spawn(run, nprocs=n_gpus, args=(n_gpus, hps,))
@@ -84,6 +107,7 @@ def run(rank, n_gpus, hps):
       len(symbols),
       hps.data.filter_length // 2 + 1,
       hps.train.segment_size // hps.data.hop_length,
+      hop_length=hps.data.hop_length,
       **hps.model).cuda(rank)
   net_d = MultiPeriodDiscriminator(hps.model.use_spectral_norm).cuda(rank)
   optim_g = torch.optim.AdamW(
@@ -294,6 +318,40 @@ def evaluate(hps, generator, eval_loader, writer_eval):
     audio_dict = {
       "gen/audio": y_hat[0,:,:y_hat_lengths[0]]
     }
+    
+    # Infer test sentences (up to N, configurable via hps.train.max_eval_texts, default 5)
+    global _eval_text_tensors
+    if _eval_text_tensors is None:
+        eval_texts = getattr(hps.data, 'eval_texts', None) or DEFAULT_EVAL_TEXTS
+        max_eval_texts = getattr(hps.train, 'max_eval_texts', 5)
+        _eval_text_tensors = []
+        for test_text in eval_texts[:max_eval_texts]:
+            t_text_norm = get_text_for_eval(test_text, hps)
+            _eval_text_tensors.append(t_text_norm)
+    
+    for t_idx, t_text_norm in enumerate(_eval_text_tensors):
+        t_text_norm_cuda = t_text_norm.unsqueeze(0).cuda(0)
+        t_text_lengths = torch.LongTensor([t_text_norm.size(0)]).cuda(0)
+        
+        audio_test, _, t_mask, *_ = generator.module.infer(
+            t_text_norm_cuda, t_text_lengths, 
+            noise_scale=.667, noise_scale_w=0.8, length_scale=1.0
+        )
+        
+        test_audio_lengths = t_mask.sum([1,2]).long() * hps.data.hop_length
+        y_test_mel = mel_spectrogram_torch(
+            audio_test.squeeze(1).float(),
+            hps.data.filter_length,
+            hps.data.n_mel_channels,
+            hps.data.sampling_rate,
+            hps.data.hop_length,
+            hps.data.win_length,
+            hps.data.mel_fmin,
+            hps.data.mel_fmax
+        )
+        image_dict[f"gen/mel_test{t_idx}"] = utils.plot_spectrogram_to_numpy(y_test_mel[0].cpu().numpy())
+        audio_dict[f"gen/audio_test{t_idx}"] = audio_test[0,:,:test_audio_lengths[0]]
+    
     if global_step == 0:
       image_dict.update({"gt/mel": utils.plot_spectrogram_to_numpy(mel[0].cpu().numpy())})
       audio_dict.update({"gt/audio": y[0,:,:y_lengths[0]]})

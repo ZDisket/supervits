@@ -44,7 +44,7 @@ def main():
 
   n_gpus = torch.cuda.device_count()
   os.environ['MASTER_ADDR'] = 'localhost'
-  os.environ['MASTER_PORT'] = '80000'
+  os.environ['MASTER_PORT'] = '55555'
 
   hps = utils.get_hparams()
   mp.spawn(run, nprocs=n_gpus, args=(n_gpus, hps,))
@@ -84,6 +84,7 @@ def run(rank, n_gpus, hps):
       len(symbols),
       hps.data.filter_length // 2 + 1,
       hps.train.segment_size // hps.data.hop_length,
+      hop_length=hps.data.hop_length,
       n_speakers=hps.data.n_speakers,
       **hps.model).cuda(rank)
   net_d = MultiPeriodDiscriminator(hps.model.use_spectral_norm).cuda(rank)

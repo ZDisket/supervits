@@ -26,14 +26,12 @@ def text_to_sequence(text, cleaner_names):
 
 
 def cleaned_text_to_sequence(cleaned_text):
-  '''Converts a string of text to a sequence of IDs corresponding to the symbols in the text.
-    Args:
-      text: string to convert to a sequence
-    Returns:
-      List of integers corresponding to the symbols in the text
-  '''
-  sequence = [_symbol_to_id[symbol] for symbol in cleaned_text]
-  return sequence
+    return [
+        _symbol_to_id[symbol]
+        for symbol in cleaned_text
+        if symbol in _symbol_to_id
+    ]
+
 
 
 def sequence_to_text(sequence):

@@ -1,5 +1,6 @@
 import argparse
 import text
+from tqdm import tqdm
 from utils import load_filepaths_and_text
 
 if __name__ == '__main__':
@@ -15,11 +16,17 @@ if __name__ == '__main__':
   for filelist in args.filelists:
     print("START:", filelist)
     filepaths_and_text = load_filepaths_and_text(filelist)
-    for i in range(len(filepaths_and_text)):
-      original_text = filepaths_and_text[i][args.text_index]
-      cleaned_text = text._clean_text(original_text, args.text_cleaners)
-      filepaths_and_text[i][args.text_index] = cleaned_text
-
     new_filelist = filelist + "." + args.out_extension
+    
     with open(new_filelist, "w", encoding="utf-8") as f:
-      f.writelines(["|".join(x) + "\n" for x in filepaths_and_text])
+      for i in tqdm(range(len(filepaths_and_text)), desc=f"Cleaning {filelist}"):
+        original_text = filepaths_and_text[i][args.text_index]
+        try:
+          cleaned_text = text._clean_text(original_text, args.text_cleaners)
+          filepaths_and_text[i][args.text_index] = cleaned_text
+          f.write("|".join(filepaths_and_text[i]) + "\n")
+        except KeyboardInterrupt:
+          break
+        except Exception as e:
+          print(f"WARNING: Error cleaning text in {filelist} at index {i}: {e}")
+          continue

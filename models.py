@@ -443,6 +443,7 @@ class SynthesizerTrn(nn.Module):
     gen_istft_n_fft=16, 
     gen_istft_hop_size=4, 
     gen_istft_win_size=16,
+    hop_length=None,
     **kwargs):
 
     super().__init__()
@@ -462,6 +463,7 @@ class SynthesizerTrn(nn.Module):
     self.upsample_initial_channel = upsample_initial_channel
     self.upsample_kernel_sizes = upsample_kernel_sizes
     self.segment_size = segment_size
+    self.segment_size_waveform = segment_size * hop_length
     self.n_speakers = n_speakers
     self.n_speakers = n_speakers
     self.gin_channels = gin_channels
@@ -530,7 +532,7 @@ class SynthesizerTrn(nn.Module):
 
     z_slice, ids_slice = commons.rand_slice_segments(z, y_lengths, self.segment_size)
     # Calculate expected output length: segment_size is the waveform length in training
-    output_length = self.segment_size
+    output_length = self.segment_size_waveform
     o = self.dec(z_slice, g=g, length=output_length)
     return o, l_length, attn, ids_slice, x_mask, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
 

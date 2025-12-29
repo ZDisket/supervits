@@ -21,8 +21,8 @@
     "gradient_accumulation_steps": 1
   },
   "data": {
-    "training_files": "filelists/ljs_audio_text_train_filelist.txt.cleaned",
-    "validation_files": "filelists/ljs_audio_text_val_filelist.txt.cleaned",
+    "training_files": "filelists/train_filelist.txt.cleaned",
+    "validation_files": "filelists/val_filelist.txt.cleaned",
     "text_cleaners": [
       "english_cleaners2"
     ],
@@ -33,7 +33,7 @@
     "win_length": 2048,
     "n_mel_channels": 128,
     "mel_fmin": 0.0,
-    "mel_fmax": null,
+    "mel_fmax": 24000.0,
     "add_blank": true,
     "n_speakers": 0,
     "cleaned_text": true
