@@ -153,6 +153,8 @@ def get_hparams(init=True):
                       help='JSON file for configuration')
   parser.add_argument('-m', '--model', type=str, required=True,
                       help='Model name')
+  parser.add_argument('--pretrained', type=str, default=None,
+                      help='Path to folder with G_*.pth and D_*.pth checkpoints for finetuning')
   
   args = parser.parse_args()
   model_dir = os.path.join("./logs", args.model)
@@ -174,6 +176,7 @@ def get_hparams(init=True):
   
   hparams = HParams(**config)
   hparams.model_dir = model_dir
+  hparams.pretrained = args.pretrained
   return hparams
 
 

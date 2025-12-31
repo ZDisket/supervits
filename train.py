@@ -123,13 +123,21 @@ def run(rank, n_gpus, hps):
   net_g = DDP(net_g, device_ids=[rank])
   net_d = DDP(net_d, device_ids=[rank])
 
-  try:
-    _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(hps.model_dir, "G_*.pth"), net_g, optim_g)
-    _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(hps.model_dir, "D_*.pth"), net_d, optim_d)
-    global_step = (epoch_str - 1) * len(train_loader)
-  except:
+  if getattr(hps, "pretrained", None):
+    if rank == 0:
+      logger.info("Loading pretrained checkpoints from %s", hps.pretrained)
+    utils.load_checkpoint(utils.latest_checkpoint_path(hps.pretrained, "G_*.pth"), net_g, optimizer=None)
+    utils.load_checkpoint(utils.latest_checkpoint_path(hps.pretrained, "D_*.pth"), net_d, optimizer=None)
     epoch_str = 1
     global_step = 0
+  else:
+    try:
+      _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(hps.model_dir, "G_*.pth"), net_g, optim_g)
+      _, _, _, epoch_str = utils.load_checkpoint(utils.latest_checkpoint_path(hps.model_dir, "D_*.pth"), net_d, optim_d)
+      global_step = (epoch_str - 1) * len(train_loader)
+    except:
+      epoch_str = 1
+      global_step = 0
 
   scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=hps.train.lr_decay, last_epoch=epoch_str-2)
   scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optim_d, gamma=hps.train.lr_decay, last_epoch=epoch_str-2)
@@ -333,24 +341,25 @@ def evaluate(hps, generator, eval_loader, writer_eval):
         t_text_norm_cuda = t_text_norm.unsqueeze(0).cuda(0)
         t_text_lengths = torch.LongTensor([t_text_norm.size(0)]).cuda(0)
         
-        audio_test, _, t_mask, *_ = generator.module.infer(
-            t_text_norm_cuda, t_text_lengths, 
-            noise_scale=.667, noise_scale_w=0.8, length_scale=1.0
-        )
-        
-        test_audio_lengths = t_mask.sum([1,2]).long() * hps.data.hop_length
-        y_test_mel = mel_spectrogram_torch(
-            audio_test.squeeze(1).float(),
-            hps.data.filter_length,
-            hps.data.n_mel_channels,
-            hps.data.sampling_rate,
-            hps.data.hop_length,
-            hps.data.win_length,
-            hps.data.mel_fmin,
-            hps.data.mel_fmax
-        )
-        image_dict[f"gen/mel_test{t_idx}"] = utils.plot_spectrogram_to_numpy(y_test_mel[0].cpu().numpy())
-        audio_dict[f"gen/audio_test{t_idx}"] = audio_test[0,:,:test_audio_lengths[0]]
+        with torch.no_grad():
+          audio_test, _, t_mask, *_ = generator.module.infer(
+              t_text_norm_cuda, t_text_lengths, 
+              noise_scale=.667, noise_scale_w=0.8, length_scale=1.0
+          )
+    
+          test_audio_lengths = t_mask.sum([1,2]).long() * hps.data.hop_length
+          y_test_mel = mel_spectrogram_torch(
+              audio_test.squeeze(1).float(),
+              hps.data.filter_length,
+              hps.data.n_mel_channels,
+              hps.data.sampling_rate,
+              hps.data.hop_length,
+              hps.data.win_length,
+              hps.data.mel_fmin,
+              hps.data.mel_fmax
+          )
+          image_dict[f"gen/mel_test{t_idx}"] = utils.plot_spectrogram_to_numpy(y_test_mel[0].cpu().numpy())
+          audio_dict[f"gen/audio_test{t_idx}"] = audio_test[0,:,:test_audio_lengths[0]]
     
     if global_step == 0:
       image_dict.update({"gt/mel": utils.plot_spectrogram_to_numpy(mel[0].cpu().numpy())})

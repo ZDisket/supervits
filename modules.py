@@ -12,7 +12,7 @@ from torch.nn.utils import weight_norm, remove_weight_norm
 import commons
 from commons import init_weights, get_padding
 from transforms import piecewise_rational_quadratic_transform
-
+from attentions import Encoder
 
 LRELU_SLOPE = 0.1
 
@@ -327,7 +327,8 @@ class ResidualCouplingLayer(nn.Module):
       n_layers,
       p_dropout=0,
       gin_channels=0,
-      mean_only=False):
+      mean_only=False,
+      use_transformer=False):
     assert channels % 2 == 0, "channels should be divisible by 2"
     super().__init__()
     self.channels = channels
@@ -337,6 +338,12 @@ class ResidualCouplingLayer(nn.Module):
     self.n_layers = n_layers
     self.half_channels = channels // 2
     self.mean_only = mean_only
+    self.use_transformer = use_transformer
+
+    if self.use_transformer:
+      self.transformer = Encoder(self.half_channels, self.half_channels, 2, 1, 3, 0.1, 5.0)
+    else:
+      self.transformer = None
 
     self.pre = nn.Conv1d(self.half_channels, hidden_channels, 1)
     self.enc = WN(hidden_channels, kernel_size, dilation_rate, n_layers, p_dropout=p_dropout, gin_channels=gin_channels)
@@ -346,6 +353,12 @@ class ResidualCouplingLayer(nn.Module):
 
   def forward(self, x, x_mask, g=None, reverse=False):
     x0, x1 = torch.split(x, [self.half_channels]*2, 1)
+
+    if self.use_transformer:
+      residual = x0 * x_mask
+      residual = self.transformer(residual, x_mask)
+      x0 = x0 + residual
+
     h = self.pre(x0) * x_mask
     h = self.enc(h, x_mask, g=g)
     stats = self.post(h) * x_mask
