@@ -230,7 +230,7 @@ class ResidualCouplingLayer(nn.Module):
     self.use_transformer = use_transformer
 
     if self.use_transformer:
-      self.transformer = attentions.Encoder(self.half_channels, self.half_channels, 2, 1, 3, 0.1, 5.0)
+      self.attention = attentions.MultiHeadAttention(hidden_channels, hidden_channels, 2, p_dropout=p_dropout, start_i_increment=4)
     else:
       self.transformer = None
 
@@ -243,12 +243,14 @@ class ResidualCouplingLayer(nn.Module):
   def forward(self, x, x_mask, g=None, reverse=False):
     x0, x1 = torch.split(x, [self.half_channels]*2, 1)
 
-    if self.use_transformer:
-      residual = x0 * x_mask
-      residual = self.transformer(residual, x_mask)
-      x0 = x0 + residual
-
     h = self.pre(x0) * x_mask
+
+    if self.use_transformer:
+      attn_mask = x_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
+      residual = h * x_mask
+      residual = self.attention(residual, residual, attn_mask)
+      h = h + residual
+
     h = self.enc(h, x_mask, g=g)
     stats = self.post(h) * x_mask
     if not self.mean_only:
