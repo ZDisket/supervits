@@ -34,6 +34,27 @@ class Snake1d(nn.Module):
     def forward(self, x):
         return snake(x, self.alpha)
 
+class SEBlock1D(nn.Module):
+    """
+    Lightweight Squeeze-Excite attention.
+    """
+
+    def __init__(self, in_channels, reduction=16):
+        super(SEBlock1D, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(in_channels, in_channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_channels // reduction, in_channels, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1)
+        return x * y.expand_as(x)
+
 
 class LayerNorm(nn.Module):
   def __init__(self, channels, eps=1e-5):
@@ -227,6 +248,7 @@ class ResBlock1(torch.nn.Module):
 
         self.snakes1 = nn.ModuleList([Snake1d(channels) for _ in range(len(self.convs1))])
         self.snakes2 = nn.ModuleList([Snake1d(channels) for _ in range(len(self.convs2))])
+        self.se_block = SEBlock1D(channels)
 
     def forward(self, x, x_mask=None):
         for c1, c2, s1, s2 in zip(self.convs1, self.convs2, self.snakes1, self.snakes2):
@@ -239,6 +261,8 @@ class ResBlock1(torch.nn.Module):
                 xt = xt * x_mask
             xt = c2(xt)
             x = xt + x
+        
+        x = self.se_block(x)
         if x_mask is not None:
             x = x * x_mask
         return x

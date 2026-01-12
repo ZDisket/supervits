@@ -21,16 +21,10 @@ from data_utils import (
   TextAudioCollate,
   DistributedBucketSampler
 )
-from models import (
-  SynthesizerTrn,
-  MultiPeriodDiscriminator,
-)
-from losses import (
-  generator_loss,
-  discriminator_loss,
-  feature_loss,
-  kl_loss
-)
+from models import SynthesizerTrn
+from discriminators import Discriminator, DiscriminatorLoss, feature_loss
+from audio_loss import AudioLoss
+from losses import kl_loss
 from mel_processing import mel_spectrogram_torch, spec_to_mel_torch
 from text.symbols import symbols
 from text import text_to_sequence
@@ -110,7 +104,43 @@ def run(rank, n_gpus, hps):
       hps.train.segment_size // hps.data.hop_length,
       hop_length=hps.data.hop_length,
       **hps.model).cuda(rank)
-  net_d = MultiPeriodDiscriminator(hps.model.use_spectral_norm).cuda(rank)
+  # Discriminator config with defaults for backward compatibility
+  disc_cfg = getattr(hps, 'discriminator', None)
+  if disc_cfg is None:
+    disc_cfg = type('obj', (object,), {
+        'loss_type': 'hinge',
+        'use_se_blocks': False,
+        'enable_mpd': True,
+        'enable_msd': False,
+        'enable_mbsd': True,
+        'instance_noise_std': 0.0,
+        'mbsd_window_lengths': [2048, 1024, 512],
+        'mbsd_hop_factor': 0.25,
+        'c_fm': 1.0,
+    })()
+  
+  net_d = Discriminator(
+      sample_rate=hps.data.sampling_rate,
+      use_se_blocks=getattr(disc_cfg, 'use_se_blocks', False),
+      enable_mpd=getattr(disc_cfg, 'enable_mpd', True),
+      enable_msd=getattr(disc_cfg, 'enable_msd', False),
+      enable_mbsd=getattr(disc_cfg, 'enable_mbsd', True),
+      instance_noise_std=getattr(disc_cfg, 'instance_noise_std', 0.0),
+      mbsd_window_lengths=getattr(disc_cfg, 'mbsd_window_lengths', [2048, 1024, 512]),
+      mbsd_hop_factor=getattr(disc_cfg, 'mbsd_hop_factor', 0.25),
+  ).cuda(rank)
+  loss_fn = DiscriminatorLoss(loss_type=getattr(disc_cfg, 'loss_type', 'hinge'))
+  c_fm = getattr(disc_cfg, 'c_fm', 1.0)
+  
+  # Audio loss config - convert HParams to dict for AudioLoss
+  audio_loss_cfg = getattr(hps, 'audio_loss', None)
+  if audio_loss_cfg is not None:
+    audio_loss_dict = {k: getattr(audio_loss_cfg, k) for k in dir(audio_loss_cfg) if not k.startswith('_')}
+  else:
+    audio_loss_dict = {'sampling_rate': hps.data.sampling_rate, 'use_multi_scale_mel_loss': False}
+  audio_loss_dict['fp16_run'] = hps.train.fp16_run  # Pass fp16 flag for eps handling
+  audio_loss_fn = AudioLoss(audio_loss_dict, device=f'cuda:{rank}')
+  
   optim_g = torch.optim.AdamW(
       net_g.parameters(), 
       hps.train.learning_rate, 
@@ -147,14 +177,14 @@ def run(rank, n_gpus, hps):
 
   for epoch in range(epoch_str, hps.train.epochs + 1):
     if rank==0:
-      train_and_evaluate(rank, epoch, hps, [net_g, net_d], [optim_g, optim_d], [scheduler_g, scheduler_d], scaler, [train_loader, eval_loader], logger, [writer, writer_eval])
+      train_and_evaluate(rank, epoch, hps, [net_g, net_d], [optim_g, optim_d], [scheduler_g, scheduler_d], scaler, [train_loader, eval_loader], logger, [writer, writer_eval], loss_fn, c_fm, audio_loss_fn)
     else:
-      train_and_evaluate(rank, epoch, hps, [net_g, net_d], [optim_g, optim_d], [scheduler_g, scheduler_d], scaler, [train_loader, None], None, None)
+      train_and_evaluate(rank, epoch, hps, [net_g, net_d], [optim_g, optim_d], [scheduler_g, scheduler_d], scaler, [train_loader, None], None, None, loss_fn, c_fm, audio_loss_fn)
     scheduler_g.step()
     scheduler_d.step()
 
 
-def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loaders, logger, writers):
+def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loaders, logger, writers, loss_fn, c_fm, audio_loss_fn):
   net_g, net_d = nets
   optim_g, optim_d = optims
   scheduler_g, scheduler_d = schedulers
@@ -208,7 +238,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
       # Discriminator
       y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
       with autocast(device_type='cuda', enabled=False):
-        loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(y_d_hat_r, y_d_hat_g)
+        loss_disc, losses_disc_r, losses_disc_g = loss_fn.discriminator_loss(y_d_hat_r, y_d_hat_g)
         loss_disc_all = loss_disc
     
     # Gradient accumulation for discriminator
@@ -231,12 +261,14 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
       y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
       with autocast(device_type='cuda', enabled=False):
         loss_dur = torch.sum(l_length.float())
-        loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
         loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * hps.train.c_kl
 
-        loss_fm = feature_loss(fmap_r, fmap_g)
-        loss_gen, losses_gen = generator_loss(y_d_hat_g)
-        loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
+        # Perceptual audio losses (multi-scale mel, MR-STFT, pitch)
+        loss_audio, audio_loss_dict = audio_loss_fn(y, y_hat)
+
+        loss_fm = feature_loss(fmap_r, fmap_g) * c_fm
+        loss_gen, losses_gen = loss_fn.generator_loss(y_d_hat_g)
+        loss_gen_all = loss_gen + loss_fm + loss_audio + loss_dur + loss_kl
     
     # Gradient accumulation for generator
     if not is_accumulating or batch_idx == 0:
@@ -258,14 +290,18 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
     if rank==0:
       if global_step % hps.train.log_interval == 0:
         lr = optim_g.param_groups[0]['lr']
-        losses = [loss_disc, loss_gen, loss_fm, loss_mel, loss_dur, loss_kl]
+        losses = [loss_disc, loss_gen, loss_fm, loss_audio, loss_dur, loss_kl]
         logger.info('Train Epoch: {} [{:.0f}%]'.format(
           epoch,
           100. * batch_idx / len(train_loader)))
         logger.info([x.item() for x in losses] + [global_step, lr])
         
         scalar_dict = {"loss/g/total": loss_gen_all, "loss/d/total": loss_disc_all, "learning_rate": lr, "grad_norm_d": grad_norm_d, "grad_norm_g": grad_norm_g}
-        scalar_dict.update({"loss/g/fm": loss_fm, "loss/g/mel": loss_mel, "loss/g/dur": loss_dur, "loss/g/kl": loss_kl})
+        scalar_dict.update({"loss/g/fm": loss_fm, "loss/g/audio": loss_audio, "loss/g/dur": loss_dur, "loss/g/kl": loss_kl})
+        
+        # Log individual audio loss components
+        for k, v in audio_loss_dict.items():
+          scalar_dict[f"loss/g/audio/{k}"] = v
 
         scalar_dict.update({"loss/g/{}".format(i): v for i, v in enumerate(losses_gen)})
         scalar_dict.update({"loss/d_r/{}".format(i): v for i, v in enumerate(losses_disc_r)})

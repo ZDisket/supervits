@@ -29,9 +29,13 @@ def load_checkpoint(checkpoint_path, model, optimizer=None):
     state_dict = model.state_dict()
   new_state_dict= {}
   for k, v in state_dict.items():
-    try:
-      new_state_dict[k] = saved_state_dict[k]
-    except:
+    if k in saved_state_dict:
+      if v.shape == saved_state_dict[k].shape:
+        new_state_dict[k] = saved_state_dict[k]
+      else:
+        logger.warning("Shape mismatch for %s: model shape %s, checkpoint shape %s. Skipping." % (k, v.shape, saved_state_dict[k].shape))
+        new_state_dict[k] = v
+    else:
       logger.info("%s is not in the checkpoint" % k)
       new_state_dict[k] = v
   if hasattr(model, 'module'):

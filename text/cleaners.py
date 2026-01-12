@@ -43,6 +43,37 @@ _abbreviations = [(re.compile('\\b%s\\.' % x[0], re.IGNORECASE), x[1]) for x in 
 ]]
 
 
+def phonemize_gruut(text, lang="en-us"):
+    from gruut import sentences
+    punctuation = ",.!;?:|‖"
+    
+    def _phonemize_one(t):
+        out = ""
+
+        for sent in sentences(t, lang=lang):
+            for word in sent:
+                out += " "
+
+                # Copy punctuation verbatim
+                if word.text in punctuation:
+                    out += word.text
+                    continue
+
+                # Phonemize if possible
+                if word.phonemes:
+                    out += "".join(word.phonemes)
+                else:
+                    out += word.text
+
+        return out.strip()
+
+    # Handle list vs single string
+    if isinstance(text, list):
+        return [_phonemize_one(t) for t in text]
+
+    return _phonemize_one(text)
+
+
 def expand_abbreviations(text):
   for regex, replacement in _abbreviations:
     text = re.sub(regex, replacement, text)
@@ -92,9 +123,35 @@ def english_cleaners(text):
 
 def english_cleaners2(text):
   '''Pipeline for English text, including abbreviation expansion. + punctuation + stress'''
-  text = convert_to_ascii(text)
-  text = lowercase(text)
-  text = expand_abbreviations(text)
+  if isinstance(text, list):
+    text = [expand_abbreviations(lowercase(convert_to_ascii(t))) for t in text]
+  else:
+    text = expand_abbreviations(lowercase(convert_to_ascii(text)))
+
   phonemes = phonemize(text, language='en-us', backend='espeak', strip=True, preserve_punctuation=True, with_stress=True)
-  phonemes = collapse_whitespace(phonemes)
+
+  if isinstance(phonemes, list):
+    phonemes = [collapse_whitespace(p) for p in phonemes]
+  else:
+    phonemes = collapse_whitespace(phonemes)
+
   return phonemes
+
+
+def english_cleaners2_gruut(text):
+  '''Pipeline for English text, including abbreviation expansion. + punctuation + stress'''
+  if isinstance(text, list):
+    text = [expand_abbreviations(lowercase(convert_to_ascii(t))) for t in text]
+  else:
+    text = expand_abbreviations(lowercase(convert_to_ascii(text)))
+
+  phonemes = phonemize_gruut(text, lang="en-us")
+
+  if isinstance(phonemes, list):
+    phonemes = [collapse_whitespace(p) for p in phonemes]
+  else:
+    phonemes = collapse_whitespace(phonemes)
+
+  return phonemes
+
+

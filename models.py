@@ -3,10 +3,12 @@ import math
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 import commons
 import modules
 import attentions
+import monotonic_align
 
 from torch.nn import Conv1d, ConvTranspose1d, AvgPool1d, Conv2d
 from torch.nn.utils import weight_norm, remove_weight_norm, spectral_norm
@@ -42,9 +44,71 @@ class StochasticDurationPredictor(nn.Module):
 
     self.pre = nn.Conv1d(in_channels, filter_channels, 1)
     self.proj = nn.Conv1d(filter_channels, filter_channels, 1)
-    self.convs = modules.DDSConv(filter_channels, kernel_size, n_layers=3, p_dropout=p_dropout)
+    #self.convs = modules.DDSConv(filter_channels, kernel_size, n_layers=3, p_dropout=p_dropout)
+
+    self.conv1 = nn.Conv1d(filter_channels, filter_channels, 3, padding=1)
+    self.norm1 = nn.LayerNorm(filter_channels)
+    self.act1 = nn.ReLU()
+    self.drop1 = nn.Dropout(p_dropout)
+
+    self.conv2 = nn.Conv1d(filter_channels, filter_channels, 3, padding=1)
+    self.norm2 = nn.LayerNorm(filter_channels)
+    self.act2 = nn.ReLU()
+    
+    
+    # GRU for sequential modeling before projection
+    self.gru = nn.GRU(filter_channels, filter_channels, num_layers=1, batch_first=True, bidirectional=False)
+    self.drop2 = nn.Dropout(p_dropout * 0.5)
+    
+    self.is_export = False
+    
     if gin_channels != 0:
       self.cond = nn.Conv1d(gin_channels, filter_channels, 1)
+
+  def run_rnn(self, x, x_mask):
+    """Run GRU with proper packing/unpacking for variable-length sequences.
+    
+    Args:
+        x: Input tensor of shape [batch, channels, time]
+        x_mask: Mask tensor of shape [batch, 1, time]
+        is_export: Whether to skip packing/unpacking for ONNX export
+    
+    Returns:
+        Output tensor of shape [batch, channels, time]
+    """
+    if self.is_export:
+      # Simplified flow for ONNX export: skip packing/unpacking
+      x_t = x.transpose(1, 2)
+      x_out, _ = self.gru(x_t)
+      x_out = x_out.transpose(1, 2)
+      return x_out * x_mask
+
+    # Get lengths from mask: sum over time dimension
+    x_lengths = x_mask.squeeze(1).sum(dim=1).long()  # [batch]
+    
+    # Transpose for RNN: [batch, channels, time] -> [batch, time, channels]
+    x_t = x.transpose(1, 2)
+    
+    # Sort by length (required for pack_padded_sequence)
+    x_lengths_sorted, sort_idx = x_lengths.sort(descending=True)
+    x_sorted = x_t[sort_idx]
+    
+    # Clamp lengths to be at least 1 to avoid errors with empty sequences
+    x_lengths_clamped = x_lengths_sorted.clamp(min=1).cpu()
+    
+    # Pack, run through GRU, unpack
+    packed = pack_padded_sequence(x_sorted, x_lengths_clamped, batch_first=True, enforce_sorted=True)
+    packed_out, _ = self.gru(packed)
+    unpacked, _ = pad_packed_sequence(packed_out, batch_first=True, total_length=x_t.size(1))
+    
+    # Unsort to restore original order
+    _, unsort_idx = sort_idx.sort()
+    x_out = unpacked[unsort_idx]
+    
+    # Transpose back: [batch, time, channels] -> [batch, channels, time]
+    x_out = x_out.transpose(1, 2)
+    
+    return x_out
 
   def forward(self, x, x_mask, w=None, g=None, reverse=False, noise_scale=1.0):
     x = torch.detach(x)
@@ -52,7 +116,23 @@ class StochasticDurationPredictor(nn.Module):
     if g is not None:
       g = torch.detach(g)
       x = x + self.cond(g)
-    x = self.convs(x, x_mask)
+    #x = self.convs(x, x_mask)
+    x = x * x_mask
+    x = self.conv1(x) * x_mask
+    x = self.act1(x)
+    x = self.norm1(x.transpose(1,2)).transpose(1,2) * x_mask
+    x = self.drop1(x)
+    
+    x = self.conv2(x) * x_mask
+    x = self.act2(x)
+    x = self.norm2(x.transpose(1,2)).transpose(1,2) * x_mask
+    x = self.drop1(x)
+    
+    
+    # Apply GRU for sequential modeling
+    x = self.run_rnn(x, x_mask)
+    x = self.drop2(x) * x_mask
+    
     x = self.proj(x) * x_mask
 
     if not reverse:
@@ -109,10 +189,62 @@ class DurationPredictor(nn.Module):
     self.norm_1 = modules.LayerNorm(filter_channels)
     self.conv_2 = nn.Conv1d(filter_channels, filter_channels, kernel_size, padding=kernel_size//2)
     self.norm_2 = modules.LayerNorm(filter_channels)
+    
+    # GRU for sequential modeling before projection
+    self.gru = nn.GRU(filter_channels, filter_channels, num_layers=1, batch_first=True, bidirectional=False)
+    self.drop2 = nn.Dropout(p_dropout * 0.2)
+    
     self.proj = nn.Conv1d(filter_channels, 1, 1)
+    
+    self.is_export = False
 
     if gin_channels != 0:
       self.cond = nn.Conv1d(gin_channels, in_channels, 1)
+
+  def run_rnn(self, x, x_mask):
+    """Run GRU with proper packing/unpacking for variable-length sequences.
+    
+    Args:
+        x: Input tensor of shape [batch, channels, time]
+        x_mask: Mask tensor of shape [batch, 1, time]
+        is_export: Whether to skip packing/unpacking for ONNX export
+    
+    Returns:
+        Output tensor of shape [batch, channels, time]
+    """
+    if self.is_export:
+      # Simplified flow for ONNX export: skip packing/unpacking
+      x_t = x.transpose(1, 2)
+      x_out, _ = self.gru(x_t)
+      x_out = x_out.transpose(1, 2)
+      return x_out * x_mask
+
+    # Get lengths from mask: sum over time dimension
+    x_lengths = x_mask.squeeze(1).sum(dim=1).long()  # [batch]
+    
+    # Transpose for RNN: [batch, channels, time] -> [batch, time, channels]
+    x_t = x.transpose(1, 2)
+    
+    # Sort by length (required for pack_padded_sequence)
+    x_lengths_sorted, sort_idx = x_lengths.sort(descending=True)
+    x_sorted = x_t[sort_idx]
+    
+    # Clamp lengths to be at least 1 to avoid errors with empty sequences
+    x_lengths_clamped = x_lengths_sorted.clamp(min=1).cpu()
+    
+    # Pack, run through GRU, unpack
+    packed = pack_padded_sequence(x_sorted, x_lengths_clamped, batch_first=True, enforce_sorted=True)
+    packed_out, _ = self.gru(packed)
+    unpacked, _ = pad_packed_sequence(packed_out, batch_first=True, total_length=x_t.size(1))
+    
+    # Unsort to restore original order
+    _, unsort_idx = sort_idx.sort()
+    x_out = unpacked[unsort_idx]
+    
+    # Transpose back: [batch, time, channels] -> [batch, channels, time]
+    x_out = x_out.transpose(1, 2)
+    
+    return x_out
 
   def forward(self, x, x_mask, g=None):
     x = torch.detach(x)
@@ -127,6 +259,11 @@ class DurationPredictor(nn.Module):
     x = torch.relu(x)
     x = self.norm_2(x)
     x = self.drop(x)
+    
+    # Apply GRU for sequential modeling
+    x = self.run_rnn(x, x_mask)
+    x = self.drop2(x)
+    
     x = self.proj(x * x_mask)
     return x * x_mask
 
@@ -152,6 +289,9 @@ class TextEncoder(nn.Module):
     self.p_dropout = p_dropout
 
     self.emb = nn.Embedding(n_vocab, hidden_channels)
+    self.emb_norm = nn.LayerNorm(hidden_channels)
+    self.emb_drop = nn.Dropout(0.1)
+
     nn.init.normal_(self.emb.weight, 0.0, hidden_channels**-0.5)
 
     self.encoder = attentions.Encoder(
@@ -160,11 +300,15 @@ class TextEncoder(nn.Module):
       n_heads,
       n_layers,
       kernel_size,
-      p_dropout)
+      p_dropout,
+      start_i_increment=2)
     self.proj= nn.Conv1d(hidden_channels, out_channels * 2, 1)
 
   def forward(self, x, x_lengths):
-    x = self.emb(x) * math.sqrt(self.hidden_channels) # [b, t, h]
+    x = self.emb(x)
+    x = self.emb_norm(x)
+    x = self.emb_drop(x)
+    
     x = torch.transpose(x, 1, -1) # [b, h, t]
     x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1).to(x.dtype)
 
@@ -304,9 +448,11 @@ class PosteriorEncoder(nn.Module):
     return z, m, logs, x_mask
 
 
+
 class Generator(torch.nn.Module):
     def __init__(self, initial_channel, resblock, resblock_kernel_sizes, resblock_dilation_sizes, upsample_rates, upsample_initial_channel, upsample_kernel_sizes, gin_channels=0, gen_istft_n_fft=16, gen_istft_hop_size=4, gen_istft_win_size=16):
         super(Generator, self).__init__()
+        self._is_export = False
         self.num_kernels = len(resblock_kernel_sizes)
         self.num_upsamples = len(upsample_rates)
         self.conv_pre = Conv1d(initial_channel, upsample_initial_channel, 7, 1, padding=3)
@@ -339,8 +485,35 @@ class Generator(torch.nn.Module):
         
         self.init_istft_params()
 
+    @property
+    def is_export(self):
+        return self._is_export
+    
+    @is_export.setter
+    def is_export(self, value):
+        self._is_export = value
+        if value and not hasattr(self, '_export_istft'):
+            # Lazily initialize ONNX-compatible ISTFT module on first export
+            from torchistft import ISTFT
+            
+            # Determine device from existing parameters to ensure the new module matches
+            device = self.conv_pre.weight.device
+            
+            self._export_istft = ISTFT(
+                n_fft=self.gen_istft_n_fft,
+                hop_length=self.gen_istft_hop_size,
+                win_length=self.gen_istft_win_size,
+                window=torch.hann_window(self.gen_istft_win_size),
+            ).to(device)
+
     def init_istft_params(self):
         self.register_buffer("istft_window", torch.hann_window(self.gen_istft_win_size))
+
+    @staticmethod
+    def safe_atan2(y, x, eps=1e-8):
+        """Numerically stable atan2 that avoids zero gradients."""
+        # Add small epsilon to avoid zero denominator in gradient computation
+        return torch.atan2(y, x + eps * (x.abs() < eps).float())
 
     def forward(self, x, g=None, length=None):
         x = self.conv_pre(x)
@@ -360,24 +533,33 @@ class Generator(torch.nn.Module):
         x = self.post_snake(x)
         x = self.conv_post(x)
         
-        spec = torch.exp(x[:, :self.gen_istft_n_fft // 2 + 1, :])
+        mag_raw = x[:, :self.gen_istft_n_fft // 2 + 1, :]
+        # prevent HF ringing
+        mag_raw = torch.clamp(mag_raw, max=5.5)   
+        spec = torch.exp(mag_raw)
+        
         phase_angle = x[:, self.gen_istft_n_fft // 2 + 1:, :] 
         real = spec * torch.cos(phase_angle)
         imag = spec * torch.sin(phase_angle)
         
         # We need to construct a complex-like tensor for torch.istft 
         # Modern pytorch requires complex input
-        stft = torch.complex(real, imag)
-
-        x = torch.istft(
-            stft, 
-            n_fft=self.gen_istft_n_fft, 
-            hop_length=self.gen_istft_hop_size, 
-            win_length=self.gen_istft_win_size, 
-            window=self.istft_window, 
-            center=True,
-            length=length
-        )
+        if self._is_export:
+            # Use ONNX-compatible custom ISTFT
+            # Format: [batch, freq_bins, time, 2] where last dim is [real, imag]
+            stft_export = torch.stack([real, imag], dim=-1)
+            x = self._export_istft(stft_export)
+        else:
+            stft = torch.complex(real, imag)
+            x = torch.istft(
+                stft, 
+                n_fft=self.gen_istft_n_fft, 
+                hop_length=self.gen_istft_hop_size, 
+                win_length=self.gen_istft_win_size, 
+                window=self.istft_window, 
+                center=True,
+                length=length
+            )
         return x.unsqueeze(1)
 
     def remove_weight_norm(self):
@@ -511,6 +693,7 @@ class SynthesizerTrn(nn.Module):
     **kwargs):
 
     super().__init__()
+    self._is_export = False
     self.n_vocab = n_vocab
     self.spec_channels = spec_channels
     self.inter_channels = inter_channels
@@ -557,6 +740,118 @@ class SynthesizerTrn(nn.Module):
     if n_speakers > 1:
       self.emb_g = nn.Embedding(n_speakers, gin_channels)
 
+  @property
+  def is_export(self):
+    return self._is_export
+
+  @is_export.setter
+  def is_export(self, value):
+    self._is_export = value
+    if hasattr(self, 'dp'):
+      self.dp.is_export = value
+    if hasattr(self, 'dec'):
+      self.dec.is_export = value
+
+  @staticmethod
+  def compute_duration_loss(predicted_logw, target_logw, mask):
+    """
+    Compute Mean Squared Error loss for duration prediction in log-space.
+    
+    This calculates how well the duration predictor matches the ground truth durations
+    (extracted from monotonic alignment search). The loss is computed on log-durations
+    to ensure the model learns duration ratios rather than absolute differences.
+    
+    Args:
+        predicted_logw: Predicted log-durations from duration predictor [batch, 1, time]
+        target_logw: Ground truth log-durations from attention weights [batch, 1, time]
+        mask: Binary mask indicating valid (non-padded) positions [batch, 1, time]
+    
+    Returns:
+        Scalar loss value: MSE averaged over all valid frames in the batch
+    """
+    # Compute squared error between predicted and target log-durations
+    squared_error = (predicted_logw - target_logw) ** 2
+    
+    # Sum over channels (dim=1) and time (dim=2), then average by total valid frames
+    return torch.sum(squared_error, [1, 2]) / torch.sum(mask)
+
+  @staticmethod
+  def compute_temporal_consistency_loss(predicted_logw, target_logw, mask, weight=0.1):
+    """
+    Compute temporal consistency loss for duration predictions (1st order).
+    
+    This penalizes differences in how predicted vs ground truth durations evolve over time.
+    It compares the temporal dynamics (rate of change) between consecutive tokens, ensuring
+    the model learns not just the absolute durations but also their progression patterns.
+    
+    Args:
+        predicted_logw: Predicted log-durations from duration predictor [batch, 1, time]
+        target_logw: Ground truth log-durations from attention weights [batch, 1, time]
+        mask: Binary mask indicating valid (non-padded) positions [batch, 1, time]
+        weight: Scaling factor for the temporal consistency loss (default: 0.1)
+    
+    Returns:
+        Scalar loss value: MSE between predicted and target duration evolution
+    """
+    # Compute how durations evolve (differences between consecutive frames)
+    # Predicted evolution: logw[t] - logw[t-1]
+    pred_evolution = predicted_logw[:, :, 1:] - predicted_logw[:, :, :-1]
+    
+    # Ground truth evolution: logw_[t] - logw_[t-1]
+    target_evolution = target_logw[:, :, 1:] - target_logw[:, :, :-1]
+    
+    # Create mask for valid consecutive pairs (both positions must be valid)
+    consecutive_mask = mask[:, :, :-1] * mask[:, :, 1:]
+    
+    # Compute MSE between predicted and target evolution patterns
+    evolution_diff = (pred_evolution - target_evolution) ** 2
+    masked_diff = evolution_diff * consecutive_mask
+    
+    # Average over all valid consecutive pairs
+    num_valid_pairs = torch.sum(consecutive_mask).clamp(min=1.0)  # Avoid division by zero
+    temporal_loss = torch.sum(masked_diff) / num_valid_pairs
+    
+    return weight * temporal_loss
+
+  @staticmethod
+  def compute_duration_acceleration_loss(predicted_logw, target_logw, mask, weight=0.1):
+    """
+    Compute 2nd order duration loss (acceleration matching).
+    
+    This penalizes differences in how the rate of duration change evolves.
+    The 2nd derivative captures "acceleration" - whether durations are speeding up
+    or slowing down in their rate of change. This helps the model learn fine-grained
+    temporal dynamics like gradual speed-ups before pauses or slow-downs for emphasis.
+    
+    2nd derivative: logw[i+1] - 2*logw[i] + logw[i-1]
+    
+    Args:
+        predicted_logw: Predicted log-durations from duration predictor [batch, 1, time]
+        target_logw: Ground truth log-durations from attention weights [batch, 1, time]
+        mask: Binary mask indicating valid (non-padded) positions [batch, 1, time]
+        weight: Scaling factor for the acceleration loss (default: 0.1)
+    
+    Returns:
+        Scalar loss value: MSE between predicted and target duration acceleration
+    """
+    # Compute 2nd derivative (acceleration): logw[i+1] - 2*logw[i] + logw[i-1]
+    # This is equivalent to: (logw[i+1] - logw[i]) - (logw[i] - logw[i-1])
+    pred_accel = predicted_logw[:, :, 2:] - 2 * predicted_logw[:, :, 1:-1] + predicted_logw[:, :, :-2]
+    target_accel = target_logw[:, :, 2:] - 2 * target_logw[:, :, 1:-1] + target_logw[:, :, :-2]
+    
+    # Create mask for valid triplets (all three positions must be valid)
+    triplet_mask = mask[:, :, :-2] * mask[:, :, 1:-1] * mask[:, :, 2:]
+    
+    # Compute MSE between predicted and target acceleration patterns
+    accel_diff = (pred_accel - target_accel) ** 2
+    masked_diff = accel_diff * triplet_mask
+    
+    # Average over all valid triplets
+    num_valid_triplets = torch.sum(triplet_mask).clamp(min=1.0)  # Avoid division by zero
+    accel_loss = torch.sum(masked_diff) / num_valid_triplets
+    
+    return weight * accel_loss
+
   def forward(self, x, x_lengths, y, y_lengths, sid=None):
 
     x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths)
@@ -586,9 +881,19 @@ class SynthesizerTrn(nn.Module):
       l_length = self.dp(x, x_mask, w, g=g)
       l_length = l_length / torch.sum(x_mask)
     else:
-      logw_ = torch.log(w + 1e-6) * x_mask
-      logw = self.dp(x, x_mask, g=g)
-      l_length = torch.sum((logw - logw_)**2, [1,2]) / torch.sum(x_mask) # for averaging 
+      logw_ = torch.log1p(w) * x_mask  # Ground truth log1p-durations from alignment
+      logw = self.dp(x, x_mask, g=g)  # Predicted log1p-durations
+      
+      # Compute primary duration loss (MSE between predicted and target)
+      l_length = self.compute_duration_loss(logw, logw_, x_mask)
+      
+      # Add 1st order loss: match velocity (rate of change) patterns
+      l_temporal = self.compute_temporal_consistency_loss(logw, logw_, x_mask, weight=0.1)  # ~14x larger
+      
+      # Add 2nd order loss: match acceleration patterns
+      l_accel = self.compute_duration_acceleration_loss(logw, logw_, x_mask, weight=0.02)  # ~43x larger
+      
+      l_length = l_length + l_temporal + l_accel 
 
     # expand prior
     m_p = torch.matmul(attn.squeeze(1), m_p.transpose(1, 2)).transpose(1, 2)
@@ -611,7 +916,7 @@ class SynthesizerTrn(nn.Module):
       logw = self.dp(x, x_mask, g=g, reverse=True, noise_scale=noise_scale_w)
     else:
       logw = self.dp(x, x_mask, g=g)
-    w = torch.exp(logw) * x_mask * length_scale
+    w = torch.expm1(logw) * x_mask * length_scale
     w_ceil = torch.ceil(w)
     y_lengths = torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).long()
     y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, None), 1).to(x_mask.dtype)
@@ -635,4 +940,86 @@ class SynthesizerTrn(nn.Module):
     z_hat = self.flow(z_p, y_mask, g=g_tgt, reverse=True)
     o_hat = self.dec(z_hat * y_mask, g=g_tgt)
     return o_hat, y_mask, (z, z_p, z_hat)
+
+  def voice_enhancement(self, y, y_lengths, sid=None, noise_scale=0.0, bypass_flow=False):
+    if self.n_speakers > 0:
+      g = self.emb_g(sid).unsqueeze(-1)
+    else:
+      g = None
+    z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g)
+    
+    if noise_scale > 0:
+      z_input = (m_q + torch.randn_like(m_q) * torch.exp(logs_q) * noise_scale) * y_mask
+    else:
+      z_input = m_q * y_mask
+      
+    if bypass_flow:
+      z_hat = z_input
+    else:
+      z_p = self.flow(z_input, y_mask, g=g)
+      z_hat = self.flow(z_p, y_mask, g=g, reverse=True)
+      
+    o_hat = self.dec(z_hat * y_mask, g=g)
+    return o_hat, y_mask, (z, m_q, z_hat)
+
+  def resynthesis(self, x, x_lengths, y_ref, y_ref_lengths, sid=None, noise_scale=0.667):
+    """
+    Re-synthesize speech by extracting durations from reference audio
+    and applying them to text input.
+    
+    Args:
+        x: Text input tensor [batch, text_length]
+        x_lengths: Text lengths [batch]
+        y_ref: Reference audio spectrogram [batch, channels, time]
+        y_ref_lengths: Reference audio lengths [batch]
+        sid: Speaker ID (optional for multi-speaker)
+        noise_scale: Sampling noise scale (0.0 for deterministic)
+    
+    Returns:
+        o: Output waveform
+        attn: Extracted alignment/durations
+        y_mask: Output mask
+    """
+    # Encode text
+    x_enc, m_p, logs_p, x_mask = self.enc_p(x, x_lengths)
+    
+    # Get speaker embedding
+    if self.n_speakers > 0:
+      g = self.emb_g(sid).unsqueeze(-1)
+    else:
+      g = None
+    
+    # Encode reference audio to latent space
+    z, m_q, logs_q, y_mask = self.enc_q(y_ref, y_ref_lengths, g=g)
+    z_p = self.flow(z, y_mask, g=g)
+    
+    # Compute alignment between reference audio and text
+    # Same logic as training forward pass
+    with torch.no_grad():
+      # negative cross-entropy
+      s_p_sq_r = torch.exp(-2 * logs_p)  # [b, d, t_x]
+      neg_cent1 = torch.sum(-0.5 * math.log(2 * math.pi) - logs_p, [1], keepdim=True)  # [b, 1, t_x]
+      neg_cent2 = torch.matmul(-0.5 * (z_p ** 2).transpose(1, 2), s_p_sq_r)  # [b, t_y, t_x]
+      neg_cent3 = torch.matmul(z_p.transpose(1, 2), (m_p * s_p_sq_r))  # [b, t_y, t_x]
+      neg_cent4 = torch.sum(-0.5 * (m_p ** 2) * s_p_sq_r, [1], keepdim=True)  # [b, 1, t_x]
+      neg_cent = neg_cent1 + neg_cent2 + neg_cent3 + neg_cent4
+      
+      attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
+      attn = monotonic_align.maximum_path(neg_cent, attn_mask.squeeze(1)).unsqueeze(1).detach()
+    
+    # Expand priors using extracted alignment
+    m_p_expanded = torch.matmul(attn.squeeze(1), m_p.transpose(1, 2)).transpose(1, 2)
+    logs_p_expanded = torch.matmul(attn.squeeze(1), logs_p.transpose(1, 2)).transpose(1, 2)
+    
+    # Sample from expanded priors
+    if noise_scale > 0:
+      z_p_new = m_p_expanded + torch.randn_like(m_p_expanded) * torch.exp(logs_p_expanded) * noise_scale
+    else:
+      z_p_new = m_p_expanded
+    
+    # Decode through flow and generator
+    z_out = self.flow(z_p_new, y_mask, g=g, reverse=True)
+    o = self.dec(z_out * y_mask, g=g)
+    
+    return o, attn, y_mask
 

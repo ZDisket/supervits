@@ -82,9 +82,14 @@ class TextAudioLoader(torch.utils.data.Dataset):
                 sampling_rate = self.sampling_rate
         audio_norm = audio.unsqueeze(0)
         spec_filename = filename.replace(".wav", ".spec.pt")
+        spec = None
         if os.path.exists(spec_filename):
-            spec = torch.load(spec_filename)
-        else:
+            try:
+                spec = torch.load(spec_filename)
+            except Exception as e:
+                print(f"Warning: Failed to load {spec_filename}, error: {e}. Re-creating.")
+
+        if spec is None:
             spec = spectrogram_torch(audio_norm, self.filter_length,
                 self.sampling_rate, self.hop_length, self.win_length,
                 center=False)
@@ -231,9 +236,14 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
                 sampling_rate = self.sampling_rate
         audio_norm = audio.unsqueeze(0)
         spec_filename = filename.replace(".wav", ".spec.pt")
+        spec = None
         if os.path.exists(spec_filename):
-            spec = torch.load(spec_filename)
-        else:
+            try:
+                spec = torch.load(spec_filename)
+            except Exception as e:
+                print(f"Warning: Failed to load {spec_filename}, error: {e}. Re-creating.")
+
+        if spec is None:
             spec = spectrogram_torch(audio_norm, self.filter_length,
                 self.sampling_rate, self.hop_length, self.win_length,
                 center=False)

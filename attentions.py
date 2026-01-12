@@ -11,7 +11,7 @@ from modules import LayerNorm
    
 
 class Encoder(nn.Module):
-  def __init__(self, hidden_channels, filter_channels, n_heads, n_layers, kernel_size=1, p_dropout=0., alibi_alpha=1.0, **kwargs):
+  def __init__(self, hidden_channels, filter_channels, n_heads, n_layers, kernel_size=1, p_dropout=0., alibi_alpha=1.0, start_i_increment=0, **kwargs):
     super().__init__()
     self.hidden_channels = hidden_channels
     self.filter_channels = filter_channels
@@ -27,7 +27,8 @@ class Encoder(nn.Module):
     self.ffn_layers = nn.ModuleList()
     self.norm_layers_2 = nn.ModuleList()
     for i in range(self.n_layers):
-      self.attn_layers.append(MultiHeadAttention(hidden_channels, hidden_channels, n_heads, p_dropout=p_dropout, alibi_alpha=alibi_alpha, start_i_increment=i * n_heads))
+      alibi_index = (start_i_increment + i) * n_heads
+      self.attn_layers.append(MultiHeadAttention(hidden_channels, hidden_channels, n_heads, p_dropout=p_dropout, alibi_alpha=alibi_alpha, start_i_increment=alibi_index))
       self.norm_layers_1.append(LayerNorm(hidden_channels))
       self.ffn_layers.append(FFN(hidden_channels, hidden_channels, filter_channels, kernel_size, p_dropout=p_dropout))
       self.norm_layers_2.append(LayerNorm(hidden_channels))
